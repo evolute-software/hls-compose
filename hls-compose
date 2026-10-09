@@ -1,0 +1,82 @@
+#!/bin/sh
+# hls-compose: LSP bridge from a host editor into a docker compose
+# dev service. Runs haskell-language-server inside the compose
+# service that owns the project being edited, and pipes the LSP
+# stream over stdio.
+#
+# LSP clients start the language server with the project root as
+# cwd, so discovery starts from $PWD:
+#   1. walk up to the nearest compose file
+#   2. find the service that bind-mounts the project directory
+#   3. make sure it runs, then exec HLS in it
+#
+# The compose project must satisfy the contract described in the
+# README (a dev service with an identical-path bind mount and
+# haskell-language-server-wrapper on its PATH). Override discovery
+# with HLS_COMPOSE_SERVICE=<service-name>.
+#
+# stdout carries only the LSP stream; all diagnostics go to stderr.
+
+set -eu
+
+proj=$PWD
+
+# 1. nearest compose file above the project root.
+compose_file=
+dir=$proj
+while :; do
+  for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+    if [ -f "$dir/$f" ]; then
+      compose_file=$dir/$f
+      break 2
+    fi
+  done
+  if [ "$dir" = "/" ]; then
+    break
+  fi
+  dir=$(dirname "$dir")
+done
+
+if [ -z "$compose_file" ]; then
+  echo "hls-compose: no compose file found above $proj" >&2
+  exit 1
+fi
+
+compose="docker compose -f $compose_file --project-directory $dir --profile dev"
+
+# 2. the service to jump into.
+if [ -n "${HLS_COMPOSE_SERVICE:-}" ]; then
+  service=$HLS_COMPOSE_SERVICE
+else
+  leaf=$(basename "$proj")
+  if $compose config --services 2>/dev/null | grep -qx "$leaf-dev"; then
+    service=$leaf-dev
+  else
+    # Bind-mount scan of the resolved compose config: the service
+    # whose bind source is the project dir (exact) or covers it.
+    service=$($compose config 2>/dev/null | awk -v proj="$proj" '
+      /^  [A-Za-z0-9_.-]+:$/ {
+        svc = $0
+        sub(/^  /, "", svc)
+        sub(/:$/, "", svc)
+      }
+      /^ +source: / {
+        src = $NF
+        if (proj == src && exact == "") exact = svc
+        if (index(proj, src "/") == 1 && approx == "") approx = svc
+      }
+      END { print (exact != "" ? exact : approx) }')
+  fi
+fi
+
+if [ -z "$service" ]; then
+  echo "hls-compose: no compose service bind-mounts $proj" >&2
+  echo "hls-compose: add a dev service to $compose_file that" >&2
+  echo "hls-compose: bind-mounts the project and provides HLS" >&2
+  echo "hls-compose: (see the README), or set HLS_COMPOSE_SERVICE" >&2
+  exit 1
+fi
+
+# 3. start (if needed) and bridge the LSP stream into the service.
+$compose up -d "$service" >&2
+exec $compose exec -T "$service" haskell-language-server-wrapper --lsp
