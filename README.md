@@ -13,12 +13,17 @@ Repository: https://github.com/evolute-software/hls-compose
 
 ## Behavior
 
-LSP clients start a language server with the project root as the
-working directory. From there the script:
+The project root is taken from the `rootUri` (or the first
+`workspaceFolders` entry) of the client's first LSP message, the
+`initialize` request, which the script reads from stdin before
+doing anything else. LSP clients cannot be relied on to start the
+server with the project root as the working directory: coc.nvim,
+for example, spawns language servers with the editor's cwd. If the
+request carries neither, the script falls back to its own cwd.
+From the project root the script:
 
-1. Walks up from the current directory to the nearest compose file
-   (`docker-compose.yml`, `docker-compose.yaml`, `compose.yml` or
-   `compose.yaml`).
+1. Walks up to the nearest compose file (`docker-compose.yml`,
+   `docker-compose.yaml`, `compose.yml` or `compose.yaml`).
 2. Picks the compose service to use, in this order:
    - `HLS_COMPOSE_SERVICE` environment variable (explicit
      override, always wins);
@@ -29,7 +34,11 @@ working directory. From there the script:
 3. Runs `docker compose up -d <service>` so the service is up
    (diagnostics go to stderr).
 4. Execs `haskell-language-server-wrapper --lsp` in the service
-   with stdin/stdout bridged.
+   with the working directory set to the project root, replays the
+   buffered `initialize` request, and streams the rest of stdin.
+
+The buffered message is replayed byte-exact (headers and body), so
+the bridge is transparent to the client.
 
 stdout carries only the LSP stream. All script and docker
 diagnostics go to stderr, which most editors show in their LSP
@@ -105,15 +114,17 @@ In `~/.vim/coc-settings.json`:
 }
 ```
 
-Adjust `command` to wherever you cloned the repository. Keep
-`rootPatterns` so the server starts with the project root (not the
-workspace root) as cwd; discovery depends on it.
+Adjust `command` to wherever you cloned the repository. The
+`rootPatterns` matter less now that the project root comes from
+`rootUri`, but keep them so coc resolves the right workspace root
+for the request.
 
 ### Other LSP clients
 
 Any client that can spawn a server command works: point it at the
-script with no arguments. The client must start the process with
-the project root as cwd, which is standard LSP behavior.
+script with no arguments. The project root is taken from the
+client's own `initialize` request, so the client's cwd does not
+matter.
 
 ## Notes
 

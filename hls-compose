@@ -4,8 +4,10 @@
 # service that owns the project being edited, and pipes the LSP
 # stream over stdio.
 #
-# LSP clients start the language server with the project root as
-# cwd, so discovery starts from $PWD:
+# The project root is taken from the rootUri of the client's
+# first LSP message (the initialize request); LSP clients do not
+# reliably start the server with the project root as cwd (coc.nvim
+# does not set cwd at all). From the project root:
 #   1. walk up to the nearest compose file
 #   2. find the service that bind-mounts the project directory
 #   3. make sure it runs, then exec HLS in it
@@ -19,7 +21,42 @@
 
 set -eu
 
-proj=$PWD
+# 0. Read the initialize request: the client sends it right after
+# spawning us. It is buffered byte-exact (headers plus body) and
+# replayed to HLS below. rootUri gives the project root,
+# workspaceFolders[0].uri is the fallback, without either the
+# current directory is used.
+CR=$(printf '\r')
+hdr=
+clen=
+while IFS= read -r line; do
+  line=${line%"$CR"}
+  hdr="$hdr$line$CR
+"
+  case $line in
+    "Content-Length: "*) clen=${line#"Content-Length: "};;
+    "") [ -n "$clen" ] && break;;
+  esac
+done
+if [ -z "$clen" ]; then
+  echo "hls-compose: no LSP initialize request on stdin" >&2
+  exit 1
+fi
+body=$(dd bs=1 count="$clen" 2>/dev/null)
+first="$hdr$body"
+
+proj=$(printf '%s' "$body" \
+  | sed -n 's|.*"rootUri"[[:space:]]*:[[:space:]]*"file://\([^"]*\)".*|\1|p')
+if [ -z "$proj" ]; then
+  proj=$(printf '%s' "$body" \
+    | sed -n 's|.*"workspaceFolders"[[:space:]]*:[[:space:]]*\[{[[:space:]]*"uri"[[:space:]]*:[[:space:]]*"file://\([^"]*\)".*|\1|p')
+fi
+if [ -z "$proj" ]; then
+  proj=$PWD
+else
+  # Minimal URI percent-decoding (spaces and common separators).
+  proj=$(printf '%s' "$proj" | sed -e 's/%20/ /g' -e 's/%3A/:/g')
+fi
 
 # 1. nearest compose file above the project root.
 compose_file=
@@ -78,5 +115,8 @@ if [ -z "$service" ]; then
 fi
 
 # 3. start (if needed) and bridge the LSP stream into the service.
+# The initialize request is replayed first, the rest is streamed.
 $compose up -d "$service" >&2
-exec $compose exec -T "$service" haskell-language-server-wrapper --lsp
+{ printf '%s' "$first"; cat; } \
+  | $compose exec -T -w "$proj" "$service" \
+      haskell-language-server-wrapper --lsp
